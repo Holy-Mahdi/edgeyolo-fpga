@@ -28,48 +28,25 @@ The main objectives are:
 
 ## High-Level Architecture
 
-```text
-                     +----------------------+
-                     |      Input Image     |
-                     +----------+-----------+
-                                |
-                                v
-                     +----------------------+
-                     |    Preprocessing     |
-                     | Resize / Normalize   |
-                     +----------+-----------+
-                                |
-                                v
-                     +----------------------+
-                     | Quantized YOLO Model |
-                     +----------+-----------+
-                                |
-                +---------------+---------------+
-                |                               |
-                v                               v
-      +--------------------+          +----------------------+
-      | Software Reference |          | Hardware Accelerator |
-      |   Golden Model     |          |   RTL / FPGA Path    |
-      +---------+----------+          +----------+-----------+
-                |                                |
-                |                                v
-                |                    +-----------------------+
-                |                    | Conv / MAC / Buffers  |
-                |                    | Control / Interfaces  |
-                |                    +-----------+-----------+
-                |                                |
-                +---------------+----------------+
-                                |
-                                v
-                     +----------------------+
-                     |  Bit-Accurate Check  |
-                     +----------+-----------+
-                                |
-                                v
-                     +----------------------+
-                     | Detection / Bounding |
-                     | Boxes / Benchmarking |
-                     +----------------------+
+```mermaid
+flowchart TD
+    A[Input Image / Camera] --> B[Preprocessing<br/>Resize • Normalize]
+    B --> C[Quantized YOLO Model]
+
+    C --> D[Software Reference<br/>Golden Model]
+    C --> E[Hardware Accelerator<br/>RTL / FPGA Path]
+
+    E --> F[Input / Weight Buffers]
+    F --> G[Convolution / MAC Engine]
+    G --> H[Quantize / Activation]
+    H --> I[Output Buffer]
+
+    D --> J[Bit-Accurate Comparison]
+    I --> J
+
+    J --> K[Detection Head]
+    K --> L[Bounding Boxes]
+    L --> M[Benchmarking<br/>Accuracy • Latency • FPS • Resources]
 ```
 
 ---
@@ -142,18 +119,27 @@ ai/
 
 Initial target:
 
-```text
-FP32 → INT8
+```mermaid
+flowchart LR
+    A[FP32 YOLO Model] --> B[Calibration Dataset]
+    B --> C[Quantization]
+    C --> D[INT8 Weights]
+    C --> E[INT8 Activations]
+    D --> F[INT8 YOLO]
+    E --> F
+    F --> G[Accuracy Evaluation]
+    G --> H{Accuracy acceptable?}
+    H -- Yes --> I[Freeze Quantization Spec]
+    H -- No --> J[Adjust Calibration / QAT]
+    J --> C
 ```
 
 Possible future experiments:
 
-```text
-INT8 → INT4
-Mixed Precision
-Per-Tensor Quantization
-Per-Channel Quantization
-```
+- INT4
+- Mixed precision
+- Per-tensor quantization
+- Per-channel quantization
 
 - [ ] Identify quantization-sensitive layers.
 - [ ] Quantize weights.
@@ -192,18 +178,19 @@ quantization/
 
 The golden model must reproduce the exact arithmetic expected from hardware.
 
-```text
-Quantized Input
-      |
-      v
-Integer Arithmetic
-      |
-      v
-Reference Layer Output
-      |
-      v
-RTL Comparison
+```mermaid
+flowchart LR
+    A[Quantized Input Tensor] --> B[Integer Convolution / MAC]
+    B --> C[Wide Accumulator]
+    C --> D[Rounding]
+    D --> E[Saturation / Clipping]
+    E --> F[Requantization]
+    F --> G[Activation]
+    G --> H[Expected Output Tensor]
+    H --> I[RTL Scoreboard]
 ```
+
+The same arithmetic rules used here become the numerical contract for the RTL implementation.
 
 - [ ] Implement integer convolution.
 - [ ] Implement accumulator behavior.
@@ -249,38 +236,47 @@ Initial accelerator focus:
 
 Possible architecture:
 
-```text
-                  +------------------+
-Input Feature --->|  Input Buffer    |
-                  +--------+---------+
-                           |
-                           v
-                  +------------------+
-                  |   Line Buffer    |
-                  +--------+---------+
-                           |
-                           v
-              +----------------------------+
-Weights ----->|    Processing Element      |
-              |         Array              |
-              |                            |
-              | MAC MAC MAC MAC ...        |
-              +-------------+--------------+
-                            |
-                            v
-                  +------------------+
-                  |   Accumulator    |
-                  +--------+---------+
-                           |
-                           v
-                  +------------------+
-                  | Quantize / ReLU  |
-                  +--------+---------+
-                           |
-                           v
-                  +------------------+
-                  |  Output Buffer   |
-                  +------------------+
+```mermaid
+flowchart LR
+    IN[Input Feature Map] --> IB[Input Buffer]
+    W[Weights] --> WB[Weight Buffer]
+
+    IB --> LB[Line / Window Buffer]
+    LB --> PE[Processing Element Array]
+    WB --> PE
+
+    PE --> ACC[Accumulator]
+    ACC --> RQ[Requantization]
+    RQ --> ACT[Activation]
+    ACT --> OB[Output Buffer]
+    OB --> OUT[Output Feature Map]
+
+    CTRL[Controller / Scheduler] -. control .-> IB
+    CTRL -. control .-> WB
+    CTRL -. control .-> PE
+    CTRL -. control .-> OB
+```
+
+### PE Array Concept
+
+```mermaid
+flowchart TB
+    X0[Input Lanes] --> P0[PE 0<br/>MAC]
+    X0 --> P1[PE 1<br/>MAC]
+    X0 --> P2[PE 2<br/>MAC]
+    X0 --> P3[PE 3<br/>MAC]
+
+    W0[Weight Lanes] --> P0
+    W0 --> P1
+    W0 --> P2
+    W0 --> P3
+
+    P0 --> SUM[Partial-Sum Reduction]
+    P1 --> SUM
+    P2 --> SUM
+    P3 --> SUM
+
+    SUM --> ACC[Accumulator / Output Register]
 ```
 
 ## Architecture Parameters
@@ -297,6 +293,24 @@ Weights ----->|    Processing Element      |
 - Input precision
 - Weight precision
 - Accumulator precision
+
+### Dataflow Exploration
+
+```mermaid
+flowchart TD
+    A[YOLO Layer] --> B{Choose dataflow}
+    B --> C[Weight-Stationary]
+    B --> D[Output-Stationary]
+    B --> E[Input-Stationary]
+
+    C --> F[Estimate BRAM / Bandwidth / Reuse]
+    D --> F
+    E --> F
+
+    F --> G[Select PE Parallelism]
+    G --> H[Cycle / Resource Model]
+    H --> I[Architecture Decision]
+```
 
 ## Design Questions
 
@@ -362,6 +376,30 @@ rtl/
     └── edgeyolo_pkg.sv
 ```
 
+### RTL Module Hierarchy
+
+```mermaid
+flowchart TD
+    TOP[edgeyolo_accelerator.sv]
+
+    TOP --> CTRL[controller.sv]
+    TOP --> SI[stream_input.sv]
+    TOP --> SO[stream_output.sv]
+    TOP --> IB[input_buffer.sv]
+    TOP --> WB[weight_buffer.sv]
+    TOP --> PA[pe_array.sv]
+    TOP --> OB[output_buffer.sv]
+
+    PA --> PE[processing_element.sv]
+    PE --> MAC[mac_unit.sv]
+    PE --> ACC[accumulator.sv]
+    ACC --> ACT[activation_unit.sv]
+
+    IB --> LB[line_buffer.sv]
+    SI --> FIFO[fifo.sv]
+    SO --> FIFO
+```
+
 ## RTL Milestones
 
 - [ ] MAC unit
@@ -386,21 +424,36 @@ rtl/
 
 Verification strategy:
 
-```text
-             Python Golden Model
-                     |
-                     v
-               Expected Data
-                     |
-                     v
-+---------+    +-----------+    +---------+
-| Driver  |--->|    DUT    |--->| Monitor |
-+---------+    +-----------+    +----+----+
-                                      |
-                                      v
-                                +-----------+
-                                | Scoreboard|
-                                +-----------+
+```mermaid
+flowchart LR
+    GM[Python Golden Model] --> EV[Expected Vectors]
+
+    SEQ[Test / Sequence] --> DRV[Driver]
+    DRV --> DUT[RTL DUT]
+    DUT --> MON[Monitor]
+
+    EV --> SB[Scoreboard]
+    MON --> SB
+
+    DUT --> SVA[SystemVerilog Assertions]
+    MON --> COV[Functional Coverage]
+
+    SB --> R{Match?}
+    R -- Yes --> PASS[Pass]
+    R -- No --> FAIL[Failure + Debug Artifact]
+```
+
+### Verification Feedback Loop
+
+```mermaid
+flowchart TD
+    A[Test Generation] --> B[Simulation]
+    B --> C[Scoreboard + Assertions]
+    C --> D[Coverage Analysis]
+    D --> E{Coverage goal met?}
+    E -- No --> F[Add Directed / Random Tests]
+    F --> A
+    E -- Yes --> G[Regression Sign-off]
 ```
 
 ## Verification Features
@@ -475,6 +528,20 @@ verification/
 
 **Goal:** Map the verified RTL design to FPGA.
 
+```mermaid
+flowchart LR
+    A[Verified RTL] --> B[Synthesis]
+    B --> C[Resource Report]
+    B --> D[Timing Constraints]
+    D --> E[Place & Route]
+    E --> F[Timing Analysis]
+    F --> G{Timing closed?}
+    G -- No --> H[Pipeline / Floorplan / Optimize]
+    H --> B
+    G -- Yes --> I[Bitstream]
+    I --> J[Hardware Validation]
+```
+
 - [ ] Create FPGA project.
 - [ ] Add timing constraints.
 - [ ] Run synthesis.
@@ -521,38 +588,25 @@ verification/
 
 Possible first integration strategy:
 
-```text
-CPU / Host
-   |
-   | preprocessing + control
-   v
-FPGA Accelerator
-   |
-   | accelerated compute
-   v
-CPU / Host
-   |
-   | remaining layers / post-processing
-   v
-Detections
+```mermaid
+flowchart LR
+    IN[Image / Frame] --> HOST1[Host Preprocessing]
+    HOST1 --> DMA1[Tensor Transfer]
+    DMA1 --> FPGA[FPGA Accelerator]
+    FPGA --> DMA2[Accelerated Feature Maps]
+    DMA2 --> HOST2[Remaining YOLO Layers / Postprocessing]
+    HOST2 --> DET[Detections]
 ```
 
 Long-term target:
 
-```text
-Camera
-   |
-   v
-Preprocessing
-   |
-   v
-FPGA YOLO Pipeline
-   |
-   v
-Detection Head
-   |
-   v
-Bounding Boxes
+```mermaid
+flowchart LR
+    CAM[Camera] --> PRE[FPGA Preprocessing]
+    PRE --> BACKBONE[Accelerated YOLO Backbone / Neck]
+    BACKBONE --> HEAD[Detection Head]
+    HEAD --> BOX[Bounding Boxes]
+    BOX --> DISP[Display / Host Output]
 ```
 
 - [ ] Export model weights.
@@ -571,20 +625,16 @@ Bounding Boxes
 
 Possible demo pipeline:
 
-```text
-Camera
-  |
-  v
-Frame Capture
-  |
-  v
-FPGA-Accelerated YOLO
-  |
-  v
-Bounding Boxes
-  |
-  v
-Display / HDMI / Host UI
+```mermaid
+flowchart LR
+    CAM[Camera / Video] --> CAP[Frame Capture]
+    CAP --> INF[FPGA-Accelerated YOLO]
+    INF --> BOX[Bounding Boxes + Scores]
+    BOX --> OVL[Overlay Engine]
+    OVL --> UI[Display / HDMI / Host UI]
+
+    INF --> PERF[Latency + FPS Counters]
+    PERF --> UI
 ```
 
 Demo requirements:
@@ -604,9 +654,23 @@ Demo requirements:
 
 Compare:
 
-1. Floating-point software model
-2. Quantized software model
-3. FPGA-accelerated quantized model
+```mermaid
+flowchart LR
+    DATA[Same Evaluation Dataset] --> FP32[FP32 Software]
+    DATA --> INT8[INT8 Software]
+    DATA --> FPGA[INT8 FPGA]
+
+    FP32 --> RES[Unified Benchmark Report]
+    INT8 --> RES
+    FPGA --> RES
+
+    RES --> M1[Accuracy]
+    RES --> M2[Latency / FPS]
+    RES --> M3[Power / Energy]
+    RES --> M4[FPGA Resources]
+```
+
+The three paths must use the same evaluation inputs and clearly documented preprocessing whenever possible.
 
 ## Final Benchmark Table
 
@@ -644,17 +708,29 @@ Possible optimization directions:
 - [ ] Clock-frequency optimization.
 - [ ] Resource-sharing experiments.
 
-Each optimization should be evaluated using:
+Each optimization should be evaluated using the same scorecard:
 
-```text
-Accuracy
-Latency
-Throughput
-Power
-LUT
-DSP
-BRAM
+```mermaid
+flowchart TD
+    O[Optimization Candidate] --> A[Accuracy]
+    O --> L[Latency]
+    O --> T[Throughput]
+    O --> P[Power]
+    O --> R[FPGA Resources]
+
+    R --> LUT[LUT]
+    R --> DSP[DSP]
+    R --> BRAM[BRAM]
+
+    A --> D{Keep change?}
+    L --> D
+    T --> D
+    P --> D
+    LUT --> D
+    DSP --> D
+    BRAM --> D
 ```
+
 
 ---
 
@@ -664,32 +740,16 @@ This project treats verification as a first-class design requirement.
 
 Every major hardware block should pass through:
 
-```text
-Specification
-     |
-     v
-Python Reference
-     |
-     v
-RTL Implementation
-     |
-     v
-Directed Testing
-     |
-     v
-Random Testing
-     |
-     v
-Assertions
-     |
-     v
-Functional Coverage
-     |
-     v
-Regression
-     |
-     v
-FPGA
+```mermaid
+flowchart LR
+    SPEC[Specification] --> REF[Python Reference]
+    REF --> RTL[RTL Implementation]
+    RTL --> DIR[Directed Tests]
+    DIR --> RND[Random Tests]
+    RND --> SVA[Assertions]
+    SVA --> COV[Functional Coverage]
+    COV --> REG[Regression]
+    REG --> FPGA[FPGA Validation]
 ```
 
 The FPGA implementation should not be considered complete until the hardware results match the fixed-point reference model within the explicitly defined arithmetic rules.
@@ -760,6 +820,20 @@ edgeyolo-fpga/
 ---
 
 # Milestone Overview
+
+```mermaid
+flowchart LR
+    M0[M0<br/>Scope] --> M1[M1<br/>YOLO Baseline]
+    M1 --> M2[M2<br/>INT8 Quantization]
+    M2 --> M3[M3<br/>Golden Model]
+    M3 --> M4[M4<br/>Architecture]
+    M4 --> M5[M5<br/>RTL]
+    M5 --> M6[M6<br/>Verification]
+    M6 --> M7[M7<br/>FPGA]
+    M7 --> M8[M8<br/>YOLO Integration]
+    M8 --> M9[M9<br/>Real-Time Demo]
+    M9 --> M10[M10<br/>Benchmark + Optimize]
+```
 
 | Milestone | Description | Status |
 |---|---|---|
@@ -841,22 +915,35 @@ The project is considered successful when:
 
 This project is intentionally designed to demonstrate an intersection of:
 
-```text
-Artificial Intelligence
-        +
-Computer Vision
-        +
-Quantized Neural Networks
-        +
-Hardware Acceleration
-        +
-RTL Design
-        +
-SystemVerilog
-        +
-Functional Verification
-        +
-FPGA Engineering
+```mermaid
+mindmap
+  root((EdgeYOLO-FPGA))
+    AI
+      Deep Learning
+      YOLO
+      Quantization
+    Computer Vision
+      Object Detection
+      Preprocessing
+      Evaluation
+    Hardware Acceleration
+      PE Array
+      Dataflow
+      Memory Architecture
+    RTL
+      SystemVerilog
+      Pipelining
+      Interfaces
+    Verification
+      Golden Model
+      Assertions
+      Functional Coverage
+      Regression
+    FPGA
+      Synthesis
+      Timing Closure
+      Resource Analysis
+      Benchmarking
 ```
 
 ---
